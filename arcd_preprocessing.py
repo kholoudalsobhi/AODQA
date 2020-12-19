@@ -2,14 +2,10 @@
 #
 # This script applies AraBERT's cleaning process and segmentation to ARCD or
 # any SQUAD-like structured files and "naively" re-alligns the answers start positions
-from transformers import AutoTokenizer, AutoModel
-from AODQA.preprocess_arabert import never_split_tokens, preprocess
-from farasa.segmenter import FarasaSegmenter
 
-arabert_tokenizer = AutoTokenizer.from_pretrained("aubmindlab/bert-base-arabert")
-arabert_model = AutoModel.from_pretrained("aubmindlab/bert-base-arabert")
+
 import tensorflow as tf
-from AODQA.preprocess_arabert import preprocess, never_split_tokens
+from AODQA.preprocess_import preprocess, never_split_tokens
 from AODQA.tokenization import BasicTokenizer
 
 import json
