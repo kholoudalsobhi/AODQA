@@ -5,8 +5,7 @@
 
 
 import tensorflow as tf
-from preprocess_arabert import preprocess, never_split_tokens
-from tokenization import BasicTokenizer
+
 
 import json
 
