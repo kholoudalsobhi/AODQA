@@ -5,7 +5,7 @@
 
 
 import tensorflow as tf
-from AODQA.preprocess_import preprocess, never_split_tokens
+from AODQA.preprocess_arabert import preprocess, never_split_tokens
 from AODQA.tokenization import BasicTokenizer
 
 import json
