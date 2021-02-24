@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors.
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,191 +12,291 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Functions and classes related to optimization (weight updates)."""
+"""PyTorch optimization for BERT model."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+import math
+import torch
+from torch.optim import Optimizer
+from torch.optim.optimizer import required
+from torch.nn.utils import clip_grad_norm_
+import logging
+import abc
+import sys
 
-import re
-import tensorflow as tf
-import lamb_optimizer
-
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu,
-                     optimizer="adamw", poly_power=1.0, start_warmup_step=0,
-                     colocate_gradients_with_ops=False):
-    """Creates an optimizer training op."""
-    global_step = tf.train.get_or_create_global_step()
-
-    learning_rate = tf.constant(value=init_lr, shape=[], dtype=tf.float32)
-
-    # Implements linear decay of the learning rate.
-    learning_rate = tf.train.polynomial_decay(
-        learning_rate,
-        global_step,
-        num_train_steps,
-        end_learning_rate=0.0,
-        power=poly_power,
-        cycle=False,
-    )
-
-    # Implements linear warmup. I.e., if global_step - start_warmup_step <
-    # num_warmup_steps, the learning rate will be
-    # `(global_step - start_warmup_step)/num_warmup_steps * init_lr`.
-    if num_warmup_steps:
-        tf.logging.info("++++++ warmup starts at step " + str(start_warmup_step)
-                    + ", for " + str(num_warmup_steps) + " steps ++++++")
-        global_steps_int = tf.cast(global_step, tf.int32)
-        start_warm_int = tf.constant(start_warmup_step, dtype=tf.int32)
-        global_steps_int = global_steps_int - start_warm_int
-        warmup_steps_int = tf.constant(num_warmup_steps, dtype=tf.int32)
-
-        global_steps_float = tf.cast(global_steps_int, tf.float32)
-        warmup_steps_float = tf.cast(warmup_steps_int, tf.float32)
-
-        warmup_percent_done = global_steps_float / warmup_steps_float
-        warmup_learning_rate = init_lr * warmup_percent_done
-
-        is_warmup = tf.cast(global_steps_int < warmup_steps_int, tf.float32)
-        learning_rate = (
-            1.0 - is_warmup
-        ) * learning_rate + is_warmup * warmup_learning_rate
-
-    # It is OK that you use this optimizer for finetuning, since this
-    # is how the model was trained (note that the Adam m/v variables are NOT
-    # loaded from init_checkpoint.)
-    # It is OK to use AdamW in the finetuning even the model is trained by LAMB.
-    # As report in the Bert pulic github, the learning rate for SQuAD 1.1 finetune
-    # is 3e-5, 4e-5 or 5e-5. For LAMB, the users can use 3e-4, 4e-4,or 5e-4 for a
-    # batch size of 64 in the finetune.
-    if optimizer == "adamw":
-        tf.logging.info("using adamw")
-        optimizer = AdamWeightDecayOptimizer(
-            learning_rate=learning_rate,
-            weight_decay_rate=0.01,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-6,
-            exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
-    elif optimizer == "lamb":
-        tf.logging.info("using lamb")
-        optimizer = lamb_optimizer.LAMBOptimizer(
-            learning_rate=learning_rate,
-            weight_decay_rate=0.01,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-6,
-            exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
-    else:
-        raise ValueError("Not supported optimizer: ", optimizer)
-
-    if use_tpu:
-        optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
-
-    tvars = tf.trainable_variables()
-    grads = tf.gradients(loss, tvars)
-
-    # This is how the model was pre-trained.
-    (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
-
-    train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
-
-    # Normally the global step update is done inside of `apply_gradients`.
-    # However, neither `AdamWeightDecayOptimizer` nor `LAMBOptimizer` do this.
-    # But if you use a different optimizer, you should probably take this line
-    # out.
-    new_global_step = global_step + 1
-    train_op = tf.group(train_op, [global_step.assign(new_global_step)])
-    return train_op
+logger = logging.getLogger(__name__)
 
 
-class AdamWeightDecayOptimizer(tf.train.Optimizer):
-    """A basic Adam optimizer that includes "correct" L2 weight decay."""
+if sys.version_info >= (3, 4):
+    ABC = abc.ABC
+else:
+    ABC = abc.ABCMeta('ABC', (), {})
 
-    def __init__(
-        self,
-        learning_rate,
-        weight_decay_rate=0.0,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-6,
-        exclude_from_weight_decay=None,
-        name="AdamWeightDecayOptimizer",
-    ):
-        """Constructs a AdamWeightDecayOptimizer."""
-        super(AdamWeightDecayOptimizer, self).__init__(False, name)
 
-        self.learning_rate = learning_rate
-        self.weight_decay_rate = weight_decay_rate
-        self.beta_1 = beta_1
-        self.beta_2 = beta_2
-        self.epsilon = epsilon
-        self.exclude_from_weight_decay = exclude_from_weight_decay
+class _LRSchedule(ABC):
+    """ Parent of all LRSchedules here. """
+    warn_t_total = False        # is set to True for schedules where progressing beyond t_total steps doesn't make sense
+    def __init__(self, warmup=0.002, t_total=-1, **kw):
+        """
+        :param warmup:  what fraction of t_total steps will be used for linear warmup
+        :param t_total: how many training steps (updates) are planned
+        :param kw:
+        """
+        super(_LRSchedule, self).__init__(**kw)
+        if t_total < 0:
+            logger.warning("t_total value of {} results in schedule not being applied".format(t_total))
+        if not 0.0 <= warmup < 1.0 and not warmup == -1:
+            raise ValueError("Invalid warmup: {} - should be in [0.0, 1.0[ or -1".format(warmup))
+        warmup = max(warmup, 0.)
+        self.warmup, self.t_total = float(warmup), float(t_total)
+        self.warned_for_t_total_at_progress = -1
 
-    def apply_gradients(self, grads_and_vars, global_step=None, name=None):
-        """See base class."""
-        assignments = []
-        for (grad, param) in grads_and_vars:
-            if grad is None or param is None:
-                continue
+    def get_lr(self, step, nowarn=False):
+        """
+        :param step:    which of t_total steps we're on
+        :param nowarn:  set to True to suppress warning regarding training beyond specified 't_total' steps
+        :return:        learning rate multiplier for current update
+        """
+        if self.t_total < 0:
+            return 1.
+        progress = float(step) / self.t_total
+        ret = self.get_lr_(progress)
+        # warning for exceeding t_total (only active with warmup_linear
+        if not nowarn and self.warn_t_total and progress > 1. and progress > self.warned_for_t_total_at_progress:
+            logger.warning(
+                "Training beyond specified 't_total'. Learning rate multiplier set to {}. Please set 't_total' of {} correctly."
+                    .format(ret, self.__class__.__name__))
+            self.warned_for_t_total_at_progress = progress
+        # end warning
+        return ret
 
-            param_name = self._get_variable_name(param.name)
+    @abc.abstractmethod
+    def get_lr_(self, progress):
+        """
+        :param progress:    value between 0 and 1 (unless going beyond t_total steps) specifying training progress
+        :return:            learning rate multiplier for current update
+        """
+        return 1.
 
-            m = tf.get_variable(
-                name=param_name + "/adam_m",
-                shape=param.shape.as_list(),
-                dtype=tf.float32,
-                trainable=False,
-                initializer=tf.zeros_initializer(),
-            )
-            v = tf.get_variable(
-                name=param_name + "/adam_v",
-                shape=param.shape.as_list(),
-                dtype=tf.float32,
-                trainable=False,
-                initializer=tf.zeros_initializer(),
-            )
 
-            # Standard Adam update.
-            next_m = tf.multiply(self.beta_1, m) + tf.multiply(1.0 - self.beta_1, grad)
-            next_v = tf.multiply(self.beta_2, v) + tf.multiply(
-                1.0 - self.beta_2, tf.square(grad)
-            )
+class ConstantLR(_LRSchedule):
+    def get_lr_(self, progress):
+        return 1.
 
-            update = next_m / (tf.sqrt(next_v) + self.epsilon)
 
-            # Just adding the square of the weights to the loss function is *not*
-            # the correct way of using L2 regularization/weight decay with Adam,
-            # since that will interact with the m and v parameters in strange ways.
-            #
-            # Instead we want ot decay the weights in a manner that doesn't interact
-            # with the m/v parameters. This is equivalent to adding the square
-            # of the weights to the loss with plain (non-momentum) SGD.
-            if self._do_use_weight_decay(param_name):
-                update += self.weight_decay_rate * param
+class WarmupCosineSchedule(_LRSchedule):
+    """
+    Linearly increases learning rate from 0 to 1 over `warmup` fraction of training steps.
+    Decreases learning rate from 1. to 0. over remaining `1 - warmup` steps following a cosine curve.
+    If `cycles` (default=0.5) is different from default, learning rate follows cosine function after warmup.
+    """
+    warn_t_total = True
+    def __init__(self, warmup=0.002, t_total=-1, cycles=.5, **kw):
+        """
+        :param warmup:      see LRSchedule
+        :param t_total:     see LRSchedule
+        :param cycles:      number of cycles. Default: 0.5, corresponding to cosine decay from 1. at progress==warmup and 0 at progress==1.
+        :param kw:
+        """
+        super(WarmupCosineSchedule, self).__init__(warmup=warmup, t_total=t_total, **kw)
+        self.cycles = cycles
 
-            update_with_lr = self.learning_rate * update
+    def get_lr_(self, progress):
+        if progress < self.warmup:
+            return progress / self.warmup
+        else:
+            progress = (progress - self.warmup) / (1 - self.warmup)   # progress after warmup
+            return 0.5 * (1. + math.cos(math.pi * self.cycles * 2 * progress))
 
-            next_param = param - update_with_lr
 
-            assignments.extend(
-                [param.assign(next_param), m.assign(next_m), v.assign(next_v)]
-            )
-        return tf.group(*assignments, name=name)
+class WarmupCosineWithHardRestartsSchedule(WarmupCosineSchedule):
+    """
+    Linearly increases learning rate from 0 to 1 over `warmup` fraction of training steps.
+    If `cycles` (default=1.) is different from default, learning rate follows `cycles` times a cosine decaying
+    learning rate (with hard restarts).
+    """
+    def __init__(self, warmup=0.002, t_total=-1, cycles=1., **kw):
+        super(WarmupCosineWithHardRestartsSchedule, self).__init__(warmup=warmup, t_total=t_total, cycles=cycles, **kw)
+        assert(cycles >= 1.)
 
-    def _do_use_weight_decay(self, param_name):
-        """Whether to use L2 weight decay for `param_name`."""
-        if not self.weight_decay_rate:
-            return False
-        if self.exclude_from_weight_decay:
-            for r in self.exclude_from_weight_decay:
-                if re.search(r, param_name) is not None:
-                    return False
-        return True
+    def get_lr_(self, progress):
+        if progress < self.warmup:
+            return progress / self.warmup
+        else:
+            progress = (progress - self.warmup) / (1 - self.warmup)     # progress after warmup
+            ret = 0.5 * (1. + math.cos(math.pi * ((self.cycles * progress) % 1)))
+            return ret
 
-    def _get_variable_name(self, param_name):
-        """Get the variable name from the tensor name."""
-        m = re.match("^(.*):\\d+$", param_name)
-        if m is not None:
-            param_name = m.group(1)
-        return param_name
+
+class WarmupCosineWithWarmupRestartsSchedule(WarmupCosineWithHardRestartsSchedule):
+    """
+    All training progress is divided in `cycles` (default=1.) parts of equal length.
+    Every part follows a schedule with the first `warmup` fraction of the training steps linearly increasing from 0. to 1.,
+    followed by a learning rate decreasing from 1. to 0. following a cosine curve.
+    """
+    def __init__(self, warmup=0.002, t_total=-1, cycles=1., **kw):
+        assert(warmup * cycles < 1.)
+        warmup = warmup * cycles if warmup >= 0 else warmup
+        super(WarmupCosineWithWarmupRestartsSchedule, self).__init__(warmup=warmup, t_total=t_total, cycles=cycles, **kw)
+
+    def get_lr_(self, progress):
+        progress = progress * self.cycles % 1.
+        if progress < self.warmup:
+            return progress / self.warmup
+        else:
+            progress = (progress - self.warmup) / (1 - self.warmup)     # progress after warmup
+            ret = 0.5 * (1. + math.cos(math.pi * progress))
+            return ret
+
+
+class WarmupConstantSchedule(_LRSchedule):
+    """
+    Linearly increases learning rate from 0 to 1 over `warmup` fraction of training steps.
+    Keeps learning rate equal to 1. after warmup.
+    """
+    def get_lr_(self, progress):
+        if progress < self.warmup:
+            return progress / self.warmup
+        return 1.
+
+
+class WarmupLinearSchedule(_LRSchedule):
+    """
+    Linearly increases learning rate from 0 to 1 over `warmup` fraction of training steps.
+    Linearly decreases learning rate from 1. to 0. over remaining `1 - warmup` steps.
+    """
+    warn_t_total = True
+    def get_lr_(self, progress):
+        if progress < self.warmup:
+            return progress / self.warmup
+        return max((progress - 1.) / (self.warmup - 1.), 0.)
+
+
+SCHEDULES = {
+    None:       ConstantLR,
+    "none":     ConstantLR,
+    "warmup_cosine": WarmupCosineSchedule,
+    "warmup_constant": WarmupConstantSchedule,
+    "warmup_linear": WarmupLinearSchedule
+}
+
+
+class BertAdam(Optimizer):
+    """Implements BERT version of Adam algorithm with weight decay fix.
+    Params:
+        lr: learning rate
+        warmup: portion of t_total for the warmup, -1  means no warmup. Default: -1
+        t_total: total number of training steps for the learning
+            rate schedule, -1  means constant learning rate of 1. (no warmup regardless of warmup setting). Default: -1
+        schedule: schedule to use for the warmup (see above).
+            Can be `'warmup_linear'`, `'warmup_constant'`, `'warmup_cosine'`, `'none'`, `None` or a `_LRSchedule` object (see below).
+            If `None` or `'none'`, learning rate is always kept constant.
+            Default : `'warmup_linear'`
+        b1: Adams b1. Default: 0.9
+        b2: Adams b2. Default: 0.999
+        e: Adams epsilon. Default: 1e-6
+        weight_decay: Weight decay. Default: 0.01
+        max_grad_norm: Maximum norm for the gradients (-1 means no clipping). Default: 1.0
+    """
+    def __init__(self, params, lr=required, warmup=-1, t_total=-1, schedule='warmup_linear',
+                 b1=0.9, b2=0.999, e=1e-6, weight_decay=0.01, max_grad_norm=1.0, **kwargs):
+        if lr is not required and lr < 0.0:
+            raise ValueError("Invalid learning rate: {} - should be >= 0.0".format(lr))
+        if not isinstance(schedule, _LRSchedule) and schedule not in SCHEDULES:
+            raise ValueError("Invalid schedule parameter: {}".format(schedule))
+        if not 0.0 <= b1 < 1.0:
+            raise ValueError("Invalid b1 parameter: {} - should be in [0.0, 1.0[".format(b1))
+        if not 0.0 <= b2 < 1.0:
+            raise ValueError("Invalid b2 parameter: {} - should be in [0.0, 1.0[".format(b2))
+        if not e >= 0.0:
+            raise ValueError("Invalid epsilon value: {} - should be >= 0.0".format(e))
+        # initialize schedule object
+        if not isinstance(schedule, _LRSchedule):
+            schedule_type = SCHEDULES[schedule]
+            schedule = schedule_type(warmup=warmup, t_total=t_total)
+        else:
+            if warmup != -1 or t_total != -1:
+                logger.warning("warmup and t_total on the optimizer are ineffective when _LRSchedule object is provided as schedule. "
+                               "Please specify custom warmup and t_total in _LRSchedule object.")
+        defaults = dict(lr=lr, schedule=schedule,
+                        b1=b1, b2=b2, e=e, weight_decay=weight_decay,
+                        max_grad_norm=max_grad_norm)
+        super(BertAdam, self).__init__(params, defaults)
+
+    def get_lr(self):
+        lr = []
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                if len(state) == 0:
+                    return [0]
+                lr_scheduled = group['lr']
+                lr_scheduled *= group['schedule'].get_lr(state['step'])
+                lr.append(lr_scheduled)
+        return lr
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    state['next_m'] = torch.zeros_like(p.data)
+                    # Exponential moving average of squared gradient values
+                    state['next_v'] = torch.zeros_like(p.data)
+
+                next_m, next_v = state['next_m'], state['next_v']
+                beta1, beta2 = group['b1'], group['b2']
+
+                # Add grad clipping
+                if group['max_grad_norm'] > 0:
+                    clip_grad_norm_(p, group['max_grad_norm'])
+
+                # Decay the first and second moment running average coefficient
+                # In-place operations to update the averages at the same time
+                next_m.mul_(beta1).add_(1 - beta1, grad)
+                next_v.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                update = next_m / (next_v.sqrt() + group['e'])
+
+                # Just adding the square of the weights to the loss function is *not*
+                # the correct way of using L2 regularization/weight decay with Adam,
+                # since that will interact with the m and v parameters in strange ways.
+                #
+                # Instead we want to decay the weights in a manner that doesn't interact
+                # with the m/v parameters. This is equivalent to adding the square
+                # of the weights to the loss with plain (non-momentum) SGD.
+                if group['weight_decay'] > 0.0:
+                    update += group['weight_decay'] * p.data
+
+                lr_scheduled = group['lr']
+                lr_scheduled *= group['schedule'].get_lr(state['step'])
+
+                update_with_lr = lr_scheduled * update
+                p.data.add_(-update_with_lr)
+
+                state['step'] += 1
+
+                # step_size = lr_scheduled * math.sqrt(bias_correction2) / bias_correction1
+                # No bias correction
+                # bias_correction1 = 1 - beta1 ** state['step']
+                # bias_correction2 = 1 - beta2 ** state['step']
+
+        return loss
